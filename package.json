@@ -1,0 +1,10 @@
+{
+  "name": "webapi-browserless-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Render-compatible Browserless HTML gateway",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}
