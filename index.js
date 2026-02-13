@@ -50,9 +50,14 @@ function readRequestBody(req) {
 function parseFetchBody(raw) {
   if (!raw || !raw.trim()) return null;
 
+  const trimmed = raw.trim();
+  if (/^https?:\/\//i.test(trimmed)) {
+    return { url: trimmed };
+  }
+
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(trimmed);
   } catch {
     return null;
   }
@@ -77,23 +82,45 @@ async function fetchHtmlFromBrowserless(targetUrl) {
   const endpoint = new URL(BROWSERLESS_URL);
   endpoint.searchParams.set("token", BROWSERLESS_TOKEN);
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url: targetUrl }),
-  });
+  const requestPayload = {
+    url: targetUrl,
+    gotoOptions: {
+      waitUntil: "networkidle2",
+      timeout: 45000,
+    },
+    waitForTimeout: 1000,
+    bestAttempt: true,
+  };
 
-  if (!response.ok) {
-    const details = await response.text();
-    throw new Error(
-      `Browserless request failed (${response.status} ${response.statusText}): ${details}`
+  const runRequest = async (payload) => {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(
+        `Browserless request failed (${response.status} ${response.statusText}): ${details}`
+      );
+    }
+
+    return {
+      body: await response.text(),
+      contentType: response.headers.get("content-type"),
+    };
+  };
+
+  let result = await runRequest(requestPayload);
+  if (!result.body.trim()) {
+    console.warn(
+      `[${new Date().toISOString()}] Browserless returned empty body, retrying once for url="${targetUrl}"`
     );
+    result = await runRequest({ ...requestPayload, waitForTimeout: 2500 });
   }
 
-  return {
-    body: await response.text(),
-    contentType: response.headers.get("content-type"),
-  };
+  return result;
 }
 
 function pickResponseContentType(contentType, body) {
@@ -116,6 +143,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/fetch") {
     try {
       const rawBody = await readRequestBody(req);
+      console.log(
+        `[${new Date().toISOString()}] /fetch body received bytes=${Buffer.byteLength(rawBody, "utf8")}`
+      );
       const payload = parseFetchBody(rawBody);
 
       if (!payload || typeof payload.url !== "string" || !payload.url.trim()) {
@@ -131,6 +161,13 @@ const server = http.createServer(async (req, res) => {
         `[${new Date().toISOString()}] Fetching target url="${targetUrl}" via Browserless`
       );
       const result = await fetchHtmlFromBrowserless(targetUrl);
+      if (!result.body.trim()) {
+        sendJson(res, 502, {
+          error:
+            "Browserless returned an empty response body. Target site may block automation or require different wait settings.",
+        });
+        return;
+      }
       res.writeHead(200, {
         "Content-Type": pickResponseContentType(result.contentType, result.body),
       });
