@@ -3,6 +3,9 @@ const http = require("node:http");
 const PORT = Number(process.env.PORT || 3000);
 const BROWSERLESS_URL =
   process.env.BROWSERLESS_URL || "https://production-sfo.browserless.io/content";
+const BROWSERLESS_SCREENSHOT_URL =
+  process.env.BROWSERLESS_SCREENSHOT_URL ||
+  new URL("/screenshot", BROWSERLESS_URL).toString();
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
 const CAPTURE_DELAY_MS = Number(process.env.CAPTURE_DELAY_MS || 5000);
@@ -135,6 +138,46 @@ async function fetchHtmlFromBrowserless(targetUrl) {
   return result;
 }
 
+async function fetchScreenshotFromBrowserless(targetUrl) {
+  if (!BROWSERLESS_TOKEN) {
+    throw new Error("Missing BROWSERLESS_TOKEN environment variable.");
+  }
+
+  const endpoint = new URL(BROWSERLESS_SCREENSHOT_URL);
+  endpoint.searchParams.set("token", BROWSERLESS_TOKEN);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      url: targetUrl,
+      gotoOptions: {
+        waitUntil: "networkidle2",
+        timeout: 60000,
+      },
+      waitForTimeout: CAPTURE_DELAY_MS,
+      bestAttempt: true,
+      options: {
+        type: "png",
+        fullPage: true,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(
+      `Browserless screenshot failed (${response.status} ${response.statusText}): ${details}`
+    );
+  }
+
+  const bytes = Buffer.from(await response.arrayBuffer());
+  return {
+    image: bytes.toString("base64"),
+    contentType: response.headers.get("content-type") || "image/png",
+  };
+}
+
 function pickResponseContentType(contentType, body) {
   if (contentType && contentType.trim()) return contentType;
   const trimmed = body.trimStart().toLowerCase();
@@ -234,12 +277,15 @@ const server = http.createServer(async (req, res) => {
       const format =
         (typeof payload.format === "string" && payload.format.toLowerCase()) ||
         requestUrl.searchParams.get("format") ||
-        "text";
+        "json";
       console.log(
         `[${new Date().toISOString()}] Fetching target url="${targetUrl}" via Browserless format="${format}"`
       );
-      const result = await fetchHtmlFromBrowserless(targetUrl);
-      if (!result.body.trim()) {
+      const [htmlResult, screenshotResult] = await Promise.all([
+        fetchHtmlFromBrowserless(targetUrl),
+        fetchScreenshotFromBrowserless(targetUrl),
+      ]);
+      if (!htmlResult.body.trim()) {
         sendJson(res, 502, {
           error:
             "Browserless returned an empty response body. Target site may block automation or require different wait settings.",
@@ -247,25 +293,27 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      if (isHtmlContentType(result.contentType, result.body)) {
-        result.body = await inlineExternalCss(result.body, targetUrl);
+      if (isHtmlContentType(htmlResult.contentType, htmlResult.body)) {
+        htmlResult.body = await inlineExternalCss(htmlResult.body, targetUrl);
       }
 
       if (format === "json") {
         sendJson(res, 200, {
           ok: true,
           url: targetUrl,
-          contentType: pickResponseContentType(result.contentType, result.body),
-          content: result.body,
+          html: htmlResult.body,
+          image: screenshotResult.image,
+          htmlContentType: pickResponseContentType(htmlResult.contentType, htmlResult.body),
+          imageContentType: screenshotResult.contentType,
         });
         return;
       }
 
       res.writeHead(200, {
         ...CORS_HEADERS,
-        "Content-Type": pickResponseContentType(result.contentType, result.body),
+        "Content-Type": pickResponseContentType(htmlResult.contentType, htmlResult.body),
       });
-      res.end(result.body);
+      res.end(htmlResult.body);
       return;
     } catch (err) {
       console.error(`[${new Date().toISOString()}] /fetch error: ${err.message}`);
