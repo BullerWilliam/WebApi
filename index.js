@@ -5,6 +5,11 @@ const BROWSERLESS_URL =
   process.env.BROWSERLESS_URL || "https://production-sfo.browserless.io/content";
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
 
 function getClientIp(req) {
   const forwardedFor = req.headers["x-forwarded-for"];
@@ -25,7 +30,10 @@ function logRequestReceived(req) {
 }
 
 function sendJson(res, statusCode, payload) {
-  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.writeHead(statusCode, {
+    ...CORS_HEADERS,
+    "Content-Type": "application/json; charset=utf-8",
+  });
   res.end(JSON.stringify(payload));
 }
 
@@ -133,14 +141,23 @@ function pickResponseContentType(contentType, body) {
 }
 
 const server = http.createServer(async (req, res) => {
+  const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const path = requestUrl.pathname;
+
   logRequestReceived(req);
 
-  if (req.method === "GET" && req.url === "/health") {
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS_HEADERS);
+    res.end();
+    return;
+  }
+
+  if (req.method === "GET" && path === "/health") {
     sendJson(res, 200, { ok: true });
     return;
   }
 
-  if (req.method === "POST" && req.url === "/fetch") {
+  if (req.method === "POST" && path === "/fetch") {
     try {
       const rawBody = await readRequestBody(req);
       console.log(
@@ -157,8 +174,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       const targetUrl = payload.url.trim();
+      const format =
+        (typeof payload.format === "string" && payload.format.toLowerCase()) ||
+        requestUrl.searchParams.get("format") ||
+        "text";
       console.log(
-        `[${new Date().toISOString()}] Fetching target url="${targetUrl}" via Browserless`
+        `[${new Date().toISOString()}] Fetching target url="${targetUrl}" via Browserless format="${format}"`
       );
       const result = await fetchHtmlFromBrowserless(targetUrl);
       if (!result.body.trim()) {
@@ -168,7 +189,19 @@ const server = http.createServer(async (req, res) => {
         });
         return;
       }
+
+      if (format === "json") {
+        sendJson(res, 200, {
+          ok: true,
+          url: targetUrl,
+          contentType: pickResponseContentType(result.contentType, result.body),
+          content: result.body,
+        });
+        return;
+      }
+
       res.writeHead(200, {
+        ...CORS_HEADERS,
         "Content-Type": pickResponseContentType(result.contentType, result.body),
       });
       res.end(result.body);
