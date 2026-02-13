@@ -9,11 +9,62 @@ const BROWSERLESS_SCREENSHOT_URL =
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
 const CAPTURE_DELAY_MS = Number(process.env.CAPTURE_DELAY_MS || 5000);
+const SCREENSHOT_RETRIES = Number(process.env.SCREENSHOT_RETRIES || 2);
+const SCREENSHOT_BACKOFF_MS = Number(process.env.SCREENSHOT_BACKOFF_MS || 1500);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
+const CACHE_MAX_ENTRIES = Number(process.env.CACHE_MAX_ENTRIES || 200);
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
+const fetchCache = new Map();
+
+function purgeExpiredCacheEntries() {
+  const now = Date.now();
+  for (const [key, entry] of fetchCache.entries()) {
+    if (entry.expiresAt <= now) {
+      fetchCache.delete(key);
+    }
+  }
+}
+
+function getCacheKey(targetUrl) {
+  return targetUrl.trim();
+}
+
+function getCachedFetchResult(targetUrl) {
+  purgeExpiredCacheEntries();
+  const cacheKey = getCacheKey(targetUrl);
+  const entry = fetchCache.get(cacheKey);
+  if (!entry) return null;
+
+  const msLeft = entry.expiresAt - Date.now();
+  if (msLeft <= 0) {
+    fetchCache.delete(cacheKey);
+    return null;
+  }
+
+  return {
+    value: entry.value,
+    ttlRemainingMs: msLeft,
+  };
+}
+
+function setCachedFetchResult(targetUrl, value) {
+  if (CACHE_TTL_MS <= 0 || CACHE_MAX_ENTRIES <= 0) return;
+
+  purgeExpiredCacheEntries();
+  if (fetchCache.size >= CACHE_MAX_ENTRIES) {
+    const oldestKey = fetchCache.keys().next().value;
+    if (oldestKey !== undefined) fetchCache.delete(oldestKey);
+  }
+
+  fetchCache.set(getCacheKey(targetUrl), {
+    value,
+    expiresAt: Date.now() + CACHE_TTL_MS,
+  });
+}
 
 function getClientIp(req) {
   const forwardedFor = req.headers["x-forwarded-for"];
@@ -146,36 +197,53 @@ async function fetchScreenshotFromBrowserless(targetUrl) {
   const endpoint = new URL(BROWSERLESS_SCREENSHOT_URL);
   endpoint.searchParams.set("token", BROWSERLESS_TOKEN);
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      url: targetUrl,
-      gotoOptions: {
-        waitUntil: "networkidle2",
-        timeout: 60000,
-      },
-      waitForTimeout: CAPTURE_DELAY_MS,
-      bestAttempt: true,
-      options: {
-        type: "png",
-        fullPage: true,
-      },
-    }),
-  });
+  const requestPayload = {
+    url: targetUrl,
+    gotoOptions: {
+      waitUntil: "networkidle2",
+      timeout: 60000,
+    },
+    waitForTimeout: CAPTURE_DELAY_MS,
+    bestAttempt: true,
+    options: {
+      type: "png",
+      fullPage: true,
+    },
+  };
 
-  if (!response.ok) {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  for (let attempt = 0; attempt <= SCREENSHOT_RETRIES; attempt += 1) {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestPayload),
+    });
+
+    if (response.ok) {
+      const bytes = Buffer.from(await response.arrayBuffer());
+      return {
+        image: bytes.toString("base64"),
+        contentType: response.headers.get("content-type") || "image/png",
+      };
+    }
+
     const details = await response.text();
+    if (response.status === 429 && attempt < SCREENSHOT_RETRIES) {
+      const waitMs = SCREENSHOT_BACKOFF_MS * (attempt + 1);
+      console.warn(
+        `[${new Date().toISOString()}] Screenshot rate-limited (429), retrying in ${waitMs}ms (attempt ${attempt + 1}/${SCREENSHOT_RETRIES})`
+      );
+      await sleep(waitMs);
+      continue;
+    }
+
     throw new Error(
       `Browserless screenshot failed (${response.status} ${response.statusText}): ${details}`
     );
   }
 
-  const bytes = Buffer.from(await response.arrayBuffer());
-  return {
-    image: bytes.toString("base64"),
-    contentType: response.headers.get("content-type") || "image/png",
-  };
+  throw new Error("Browserless screenshot failed after retries.");
 }
 
 function pickResponseContentType(contentType, body) {
@@ -281,39 +349,72 @@ const server = http.createServer(async (req, res) => {
       console.log(
         `[${new Date().toISOString()}] Fetching target url="${targetUrl}" via Browserless format="${format}"`
       );
-      const [htmlResult, screenshotResult] = await Promise.all([
-        fetchHtmlFromBrowserless(targetUrl),
-        fetchScreenshotFromBrowserless(targetUrl),
-      ]);
-      if (!htmlResult.body.trim()) {
-        sendJson(res, 502, {
-          error:
-            "Browserless returned an empty response body. Target site may block automation or require different wait settings.",
-        });
-        return;
-      }
+      let finalHtml;
+      let finalHtmlContentType;
+      let screenshotResult = null;
+      let screenshotWarning = null;
 
-      if (isHtmlContentType(htmlResult.contentType, htmlResult.body)) {
-        htmlResult.body = await inlineExternalCss(htmlResult.body, targetUrl);
+      const cached = getCachedFetchResult(targetUrl);
+      if (cached) {
+        console.log(
+          `[${new Date().toISOString()}] Cache hit for url="${targetUrl}" ttlRemainingMs=${cached.ttlRemainingMs}`
+        );
+        finalHtml = cached.value.html;
+        finalHtmlContentType = cached.value.htmlContentType;
+        screenshotResult = cached.value.screenshotResult;
+        screenshotWarning = cached.value.screenshotWarning;
+      } else {
+        console.log(`[${new Date().toISOString()}] Cache miss for url="${targetUrl}"`);
+        const htmlResult = await fetchHtmlFromBrowserless(targetUrl);
+        if (!htmlResult.body.trim()) {
+          sendJson(res, 502, {
+            error:
+              "Browserless returned an empty response body. Target site may block automation or require different wait settings.",
+          });
+          return;
+        }
+
+        try {
+          screenshotResult = await fetchScreenshotFromBrowserless(targetUrl);
+        } catch (screenshotErr) {
+          screenshotWarning = screenshotErr.message || "Screenshot unavailable.";
+          console.warn(
+            `[${new Date().toISOString()}] Screenshot skipped for url="${targetUrl}" reason="${screenshotWarning}"`
+          );
+        }
+
+        if (isHtmlContentType(htmlResult.contentType, htmlResult.body)) {
+          htmlResult.body = await inlineExternalCss(htmlResult.body, targetUrl);
+        }
+
+        finalHtml = htmlResult.body;
+        finalHtmlContentType = pickResponseContentType(htmlResult.contentType, htmlResult.body);
+        setCachedFetchResult(targetUrl, {
+          html: finalHtml,
+          htmlContentType: finalHtmlContentType,
+          screenshotResult,
+          screenshotWarning,
+        });
       }
 
       if (format === "json") {
         sendJson(res, 200, {
           ok: true,
           url: targetUrl,
-          html: htmlResult.body,
-          image: screenshotResult.image,
-          htmlContentType: pickResponseContentType(htmlResult.contentType, htmlResult.body),
-          imageContentType: screenshotResult.contentType,
+          html: finalHtml,
+          image: screenshotResult ? screenshotResult.image : null,
+          htmlContentType: finalHtmlContentType,
+          imageContentType: screenshotResult ? screenshotResult.contentType : null,
+          warning: screenshotWarning,
         });
         return;
       }
 
       res.writeHead(200, {
         ...CORS_HEADERS,
-        "Content-Type": pickResponseContentType(htmlResult.contentType, htmlResult.body),
+        "Content-Type": finalHtmlContentType,
       });
-      res.end(htmlResult.body);
+      res.end(finalHtml);
       return;
     } catch (err) {
       console.error(`[${new Date().toISOString()}] /fetch error: ${err.message}`);
