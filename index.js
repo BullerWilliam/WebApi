@@ -6,6 +6,24 @@ const BROWSERLESS_URL =
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
 
+function getClientIp(req) {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  if (typeof forwardedFor === "string" && forwardedFor.trim()) {
+    return forwardedFor.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress || "unknown";
+}
+
+function logRequestReceived(req) {
+  console.log(
+    `[${new Date().toISOString()}] Request received: ${req.method} ${req.url} ip=${getClientIp(
+      req
+    )} userAgent="${req.headers["user-agent"] || "unknown"}" contentType="${
+      req.headers["content-type"] || "unknown"
+    }" contentLength="${req.headers["content-length"] || "unknown"}"`
+  );
+}
+
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(payload));
@@ -72,10 +90,24 @@ async function fetchHtmlFromBrowserless(targetUrl) {
     );
   }
 
-  return response.text();
+  return {
+    body: await response.text(),
+    contentType: response.headers.get("content-type"),
+  };
+}
+
+function pickResponseContentType(contentType, body) {
+  if (contentType && contentType.trim()) return contentType;
+  const trimmed = body.trimStart().toLowerCase();
+  if (trimmed.startsWith("<!doctype html") || trimmed.startsWith("<html")) {
+    return "text/html; charset=utf-8";
+  }
+  return "text/plain; charset=utf-8";
 }
 
 const server = http.createServer(async (req, res) => {
+  logRequestReceived(req);
+
   if (req.method === "GET" && req.url === "/health") {
     sendJson(res, 200, { ok: true });
     return;
@@ -94,11 +126,18 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const html = await fetchHtmlFromBrowserless(payload.url.trim());
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(html);
+      const targetUrl = payload.url.trim();
+      console.log(
+        `[${new Date().toISOString()}] Fetching target url="${targetUrl}" via Browserless`
+      );
+      const result = await fetchHtmlFromBrowserless(targetUrl);
+      res.writeHead(200, {
+        "Content-Type": pickResponseContentType(result.contentType, result.body),
+      });
+      res.end(result.body);
       return;
     } catch (err) {
+      console.error(`[${new Date().toISOString()}] /fetch error: ${err.message}`);
       sendJson(res, 500, { error: err.message || "Internal server error." });
       return;
     }
