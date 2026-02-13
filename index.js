@@ -140,6 +140,59 @@ function pickResponseContentType(contentType, body) {
   return "text/plain; charset=utf-8";
 }
 
+function isHtmlContentType(contentType, body) {
+  if (contentType && /text\/html|application\/xhtml\+xml/i.test(contentType)) {
+    return true;
+  }
+  const trimmed = body.trimStart().toLowerCase();
+  return trimmed.startsWith("<!doctype html") || trimmed.startsWith("<html");
+}
+
+function extractStylesheetLinks(html) {
+  const links = [];
+  const regex = /<link\b[^>]*>/gi;
+  let match;
+  while ((match = regex.exec(html))) {
+    const tag = match[0];
+    if (!/\brel\s*=\s*["'][^"']*stylesheet[^"']*["']/i.test(tag)) continue;
+    const hrefMatch =
+      tag.match(/\bhref\s*=\s*"([^"]+)"/i) || tag.match(/\bhref\s*=\s*'([^']+)'/i);
+    if (!hrefMatch) continue;
+    links.push({ tag, href: hrefMatch[1] });
+  }
+  return links;
+}
+
+async function inlineExternalCss(html, pageUrl) {
+  const links = extractStylesheetLinks(html);
+  if (!links.length) return html;
+
+  let out = html;
+  for (const link of links) {
+    try {
+      const cssUrl = new URL(link.href, pageUrl).toString();
+      const response = await fetch(cssUrl, {
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; RenderGateway/1.0)" },
+      });
+      if (!response.ok) {
+        console.warn(
+          `[${new Date().toISOString()}] CSS fetch failed url="${cssUrl}" status=${response.status}`
+        );
+        continue;
+      }
+      const cssText = await response.text();
+      const replacement = `<style data-inlined-from="${cssUrl}">\n${cssText}\n</style>`;
+      out = out.replace(link.tag, replacement);
+    } catch (err) {
+      console.warn(
+        `[${new Date().toISOString()}] CSS inline error href="${link.href}" reason="${err.message}"`
+      );
+    }
+  }
+
+  return out;
+}
+
 const server = http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const path = requestUrl.pathname;
@@ -188,6 +241,10 @@ const server = http.createServer(async (req, res) => {
             "Browserless returned an empty response body. Target site may block automation or require different wait settings.",
         });
         return;
+      }
+
+      if (isHtmlContentType(result.contentType, result.body)) {
+        result.body = await inlineExternalCss(result.body, targetUrl);
       }
 
       if (format === "json") {
