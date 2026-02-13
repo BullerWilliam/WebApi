@@ -5,6 +5,7 @@ const BROWSERLESS_URL =
   process.env.BROWSERLESS_URL || "https://production-sfo.browserless.io/content";
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
+const CAPTURE_DELAY_MS = Number(process.env.CAPTURE_DELAY_MS || 5000);
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -94,9 +95,9 @@ async function fetchHtmlFromBrowserless(targetUrl) {
     url: targetUrl,
     gotoOptions: {
       waitUntil: "networkidle2",
-      timeout: 45000,
+      timeout: 60000,
     },
-    waitForTimeout: 1000,
+    waitForTimeout: CAPTURE_DELAY_MS,
     bestAttempt: true,
   };
 
@@ -125,7 +126,10 @@ async function fetchHtmlFromBrowserless(targetUrl) {
     console.warn(
       `[${new Date().toISOString()}] Browserless returned empty body, retrying once for url="${targetUrl}"`
     );
-    result = await runRequest({ ...requestPayload, waitForTimeout: 2500 });
+    result = await runRequest({
+      ...requestPayload,
+      waitForTimeout: CAPTURE_DELAY_MS + 3000,
+    });
   }
 
   return result;
