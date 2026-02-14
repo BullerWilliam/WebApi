@@ -9,10 +9,11 @@ const BROWSERLESS_SCREENSHOT_URL =
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
 const CAPTURE_DELAY_MS = Number(process.env.CAPTURE_DELAY_MS || 5000);
+const SCREENSHOT_DELAY_MS = Number(process.env.SCREENSHOT_DELAY_MS || 1000);
 const SCREENSHOT_RETRIES = Number(process.env.SCREENSHOT_RETRIES || 2);
 const SCREENSHOT_BACKOFF_MS = Number(process.env.SCREENSHOT_BACKOFF_MS || 1500);
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
-const CACHE_MAX_ENTRIES = Number(process.env.CACHE_MAX_ENTRIES || 200);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || "Infinity");
+const CACHE_MAX_ENTRIES = Number(process.env.CACHE_MAX_ENTRIES || "Infinity");
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
@@ -23,7 +24,7 @@ const fetchCache = new Map();
 function purgeExpiredCacheEntries() {
   const now = Date.now();
   for (const [key, entry] of fetchCache.entries()) {
-    if (entry.expiresAt <= now) {
+    if (entry.expiresAt !== Infinity && entry.expiresAt <= now) {
       fetchCache.delete(key);
     }
   }
@@ -52,17 +53,22 @@ function getCachedFetchResult(targetUrl) {
 }
 
 function setCachedFetchResult(targetUrl, value) {
-  if (CACHE_TTL_MS <= 0 || CACHE_MAX_ENTRIES <= 0) return;
+  if (CACHE_MAX_ENTRIES <= 0) return;
 
   purgeExpiredCacheEntries();
-  if (fetchCache.size >= CACHE_MAX_ENTRIES) {
+  if (Number.isFinite(CACHE_MAX_ENTRIES) && fetchCache.size >= CACHE_MAX_ENTRIES) {
     const oldestKey = fetchCache.keys().next().value;
     if (oldestKey !== undefined) fetchCache.delete(oldestKey);
   }
 
+  const expiresAt =
+    !Number.isFinite(CACHE_TTL_MS) || CACHE_TTL_MS <= 0
+      ? Infinity
+      : Date.now() + CACHE_TTL_MS;
+
   fetchCache.set(getCacheKey(targetUrl), {
     value,
-    expiresAt: Date.now() + CACHE_TTL_MS,
+    expiresAt,
   });
 }
 
@@ -151,7 +157,7 @@ async function fetchHtmlFromBrowserless(targetUrl) {
       waitUntil: "networkidle2",
       timeout: 60000,
     },
-    waitForTimeout: CAPTURE_DELAY_MS,
+    waitForTimeout: SCREENSHOT_DELAY_MS,
     bestAttempt: true,
   };
 
